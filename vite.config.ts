@@ -28,6 +28,6 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['@cornerstonejs/dicom-image-loader', '@icr/polyseg-wasm'],
+    exclude: ['@icr/polyseg-wasm'],
   },
 });
