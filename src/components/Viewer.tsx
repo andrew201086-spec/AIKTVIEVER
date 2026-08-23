@@ -42,7 +42,7 @@ export const Viewer: React.FC<ViewerProps> = ({ imageIds }) => {
 
   useEffect(() => {
     let renderingEngine: cornerstone.RenderingEngine;
-    let volume: cornerstone.IVolume;
+    let volume: any;
 
     const setup = async () => {
       // 1. Create Rendering Engine

@@ -19,7 +19,6 @@ export async function initCornerstone() {
   cornerstoneDICOMImageLoader.external.dicomParser = dicomParser;
   
   const maxWebWorkers = navigator.hardwareConcurrency ? Math.min(navigator.hardwareConcurrency, 7) : 1;
-  const maxSynchronousRequests = 1;
 
   cornerstoneDICOMImageLoader.configure({
     useWebWorkers: true,
