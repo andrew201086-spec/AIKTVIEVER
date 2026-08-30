@@ -3,12 +3,13 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 import wasm from 'vite-plugin-wasm';
-import topLevelAwait from 'vite-plugin-top-level-await';
 
 // https://vitejs.dev/config/
 export default defineConfig({
   base: './',
-  plugins: [wasm(), topLevelAwait(), react()],
+  // Top-level await is emitted natively: the build targets esnext and the
+  // worker output is an ES module, so no await transform is needed.
+  plugins: [wasm(), react()],
   resolve: {
     alias: {
       '@icr/polyseg-wasm': path.resolve(__dirname, 'src/shims/polysegShim.ts'),
@@ -18,7 +19,7 @@ export default defineConfig({
     target: 'esnext',
   },
   worker: {
-    plugins: () => [wasm(), topLevelAwait()],
+    plugins: () => [wasm()],
     format: 'es',
   },
   server: {

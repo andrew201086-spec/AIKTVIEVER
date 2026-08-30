@@ -14,6 +14,8 @@
     "@cornerstonejs/core": "^1.77.2",
     "@cornerstonejs/dicom-image-loader": "^1.77.2",
     "@cornerstonejs/tools": "^1.77.2",
+    "@react-three/drei": "^9.122.0",
+    "@react-three/fiber": "^8.18.0",
     "@types/jszip": "^3.4.0",
     "dicom-parser": "^1.8.21",
     "gl-matrix": "^3.4.3",
@@ -22,12 +24,16 @@
     "mathjs": "^13.0.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "three": "^0.169.0",
+    "three-mesh-bvh": "^0.7.8",
     "vite-plugin-top-level-await": "^1.6.0",
-    "vite-plugin-wasm": "^3.6.0"
+    "vite-plugin-wasm": "^3.6.0",
+    "zustand": "^4.5.7"
   },
   "devDependencies": {
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.169.0",
     "@typescript-eslint/eslint-plugin": "^7.15.0",
     "@typescript-eslint/parser": "^7.15.0",
     "@vitejs/plugin-react": "^4.3.1",
