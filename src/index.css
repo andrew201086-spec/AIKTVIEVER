@@ -2,6 +2,57 @@
 @tailwind components;
 @tailwind utilities;
 
+/**
+ * Printing the report.
+ *
+ * The viewer is one full-screen application, so printing it as-is produces a
+ * page of dark chrome. Hiding everything and then revealing only the report
+ * subtree is the one approach that works without moving the node out of the
+ * React tree: `visibility` inherits, `display: none` on an ancestor would win
+ * over any rule on a descendant.
+ */
+@media print {
+  html, body, #root {
+    overflow: visible !important;
+    height: auto !important;
+    background: #fff !important;
+  }
+  body { visibility: hidden; }
+  .report-overlay, .report-overlay * { visibility: visible; }
+  .report-overlay {
+    position: absolute !important;
+    inset: 0 !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+  .report-page {
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    max-width: none !important;
+    width: auto !important;
+  }
+  .no-print { display: none !important; }
+  /* The editable field is replaced by a plain block that cannot clip. */
+  .report-text-print {
+    display: block !important;
+  }
+  .break-inside-avoid { break-inside: avoid; page-break-inside: avoid; }
+  @page { margin: 12mm; }
+}
+
+.report-page {
+  width: 210mm;
+  max-width: 100%;
+}
+
+/* The slice slider stands on end against the right edge of a viewport. */
+.slice-range {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  height: auto;
+}
+
 html, body, #root {
   width: 100%;
   height: 100%;

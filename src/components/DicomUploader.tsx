@@ -1,446 +1,478 @@
-import React, { useRef, useState } from 'react';
-import cornerstoneDICOMImageLoader from '@cornerstonejs/dicom-image-loader';
-import dicomParser from 'dicom-parser';
+import React, { useEffect, useRef, useState } from 'react';
 import JSZip from 'jszip';
-import { Upload, FolderOpen, FileText, Archive, Sparkles, Loader2, AlertCircle } from 'lucide-react';
+import {
+  Upload,
+  FolderOpen,
+  FileText,
+  Archive,
+  Sparkles,
+  Loader2,
+  AlertCircle,
+  X,
+  Clock,
+} from 'lucide-react';
+import { addCustomMetadata, clearCustomMetadata } from '../utils/customMetadataProvider';
+import { buildSeries, looksLikeDicom, NotDicomError, parseFile, slices } from '../utils/dicomParse';
+import type { SeriesInfo, SliceInfo } from '../utils/dicomParse';
+import { generateDemoStudy } from '../utils/demoStudy';
+import {
+  canReopenFolders,
+  filesFromHandle,
+  forgetStudy,
+  listRecent,
+  pickFolder,
+  whenOpened,
+  type RecentStudy,
+} from '../utils/recentStudies';
 
 interface DicomUploaderProps {
-  onImagesLoaded: (imageIds: string[]) => void;
+  onSeriesReady: (series: SeriesInfo[]) => void;
+  /** Told about the folder a study came from, so it can be offered again. */
+  onFolderOpened?: (handle: FileSystemDirectoryHandle) => void;
 }
 
-interface FileMetadata {
-  file: File;
-  zPosition: number;
-  instanceNumber: number;
-  name: string;
-}
-
-export const DicomUploader: React.FC<DicomUploaderProps> = ({ onImagesLoaded }) => {
+export const DicomUploader: React.FC<DicomUploaderProps> = ({ onSeriesReady, onFolderOpened }) => {
   const folderInputRef = useRef<HTMLInputElement>(null);
   const filesInputRef = useRef<HTMLInputElement>(null);
   const zipInputRef = useRef<HTMLInputElement>(null);
 
   const [isLoading, setIsLoading] = useState(false);
-  const [loadingStatus, setLoadingStatus] = useState<string>('');
-  const [progress, setProgress] = useState<number>(0);
+  const [status, setStatus] = useState('');
+  const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [skipped, setSkipped] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  /**
+   * Reading a folder of six hundred files takes a while, and a user who
+   * picked the wrong one should not have to wait it out or reload the page.
+   */
+  const cancelRef = useRef(false);
+  const [recent, setRecent] = useState<RecentStudy[]>([]);
 
-  // Helper to extract DICOM slice positioning for accurate 3D volume reconstruction
-  const extractDicomMeta = async (file: File): Promise<FileMetadata> => {
+  useEffect(() => {
+    listRecent().then(setRecent);
+  }, []);
+
+  /**
+   * Reopening a remembered folder. The permission prompt the browser may show
+   * has to come from the click itself, so the handle is used straight away.
+   */
+  const openRecent = async (entry: RecentStudy) => {
+    if (!entry.handle) {
+      setError(
+        'Эта папка запомнена без разрешения на повторное открытие — выберите её через «Выбрать папку».'
+      );
+      return;
+    }
     try {
-      const headerBuffer = await file.slice(0, 4096).arrayBuffer();
-      const byteArray = new Uint8Array(headerBuffer);
-      const dataSet = dicomParser.parseDicom(byteArray);
+      setError(null);
+      const files = await filesFromHandle(entry.handle);
+      onFolderOpened?.(entry.handle);
+      await processFiles(files);
+    } catch (err: any) {
+      setError(
+        err?.message === 'Доступ к папке не подтверждён'
+          ? 'Браузер не получил доступ к папке. Нажмите ещё раз и подтвердите доступ.'
+          : `Не удалось открыть папку: ${err?.message || err}`
+      );
+    }
+  };
 
-      let zPosition = 0;
-      const ippStr = dataSet.string('x00200032'); // ImagePositionPatient
-      if (ippStr) {
-        const coords = ippStr.split('\\').map(Number);
-        if (coords.length === 3 && !isNaN(coords[2])) {
-          zPosition = coords[2];
-        }
-      }
-
-      const instanceNumber = dataSet.intString('x00200013') || 0; // InstanceNumber
-      return { file, zPosition, instanceNumber, name: file.name };
-    } catch {
-      return { file, zPosition: 0, instanceNumber: 0, name: file.name };
+  /** The picker that hands back a handle we can keep. */
+  const openFolderWithHandle = async () => {
+    try {
+      setError(null);
+      const { handle, files } = await pickFolder();
+      onFolderOpened?.(handle);
+      await processFiles(files);
+    } catch (err: any) {
+      // The user closing the picker is not an error.
+      if (err?.name === 'AbortError') return;
+      setError(`Не удалось прочитать папку: ${err?.message || err}`);
     }
   };
 
   const processFiles = async (rawFiles: File[]) => {
     setError(null);
+    setSkipped([]);
     setIsLoading(true);
     setProgress(0);
-    setLoadingStatus('Фильтрация и проверка файлов...');
+    setStatus('Проверка файлов…');
+    cancelRef.current = false;
 
-    // Filter out common non-DICOM OS clutter
-    const validFiles = rawFiles.filter(f => {
-      const name = f.name.toLowerCase();
-      return !name.startsWith('.') && 
-             !name.includes('thumbs.db') && 
-             !name.endsWith('.xml') && 
-             !name.endsWith('.txt') && 
-             !name.endsWith('.json') && 
-             !name.endsWith('.pdf') &&
-             !name.endsWith('.png') &&
-             !name.endsWith('.jpg');
-    });
-
-    if (validFiles.length === 0) {
-      setError('В выбранном источнике не найдено подходящих файлов DICOM.');
-      setIsLoading(false);
-      return;
-    }
+    clearCustomMetadata();
 
     try {
-      setLoadingStatus(`Считывание метаданных (${validFiles.length} файлов)...`);
-      const metaList: FileMetadata[] = [];
-      const total = validFiles.length;
+      // Identify DICOM by its signature rather than by file name: exports carry
+      // DICOMDIR, viewer executables and files with no extension at all.
+      const candidates: File[] = [];
+      const rejected: string[] = [];
 
-      for (let i = 0; i < total; i++) {
-        const meta = await extractDicomMeta(validFiles[i]);
-        metaList.push(meta);
-        if (i % 20 === 0 || i === total - 1) {
-          setProgress(Math.round(((i + 1) / total) * 60));
+      for (let i = 0; i < rawFiles.length; i++) {
+        if (cancelRef.current) return stopped();
+        const file = rawFiles[i];
+        if (file.size < 136 || file.name.startsWith('.')) {
+          rejected.push(file.name);
+        } else if (await looksLikeDicom(file)) {
+          candidates.push(file);
+        } else {
+          rejected.push(file.name);
+        }
+        if (i % 25 === 0) {
+          setProgress(Math.round((i / rawFiles.length) * 15));
+          await yieldToUi();
         }
       }
 
-      setLoadingStatus('Сортировка срезов по пространственным координатам...');
-      // Sort by Z coordinate (or instance number fallback, or natural name sorting)
-      metaList.sort((a, b) => {
-        if (a.zPosition !== b.zPosition) {
-          return a.zPosition - b.zPosition;
-        }
-        if (a.instanceNumber !== b.instanceNumber) {
-          return a.instanceNumber - b.instanceNumber;
-        }
-        return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-      });
+      if (candidates.length === 0) {
+        setError(
+          `Файлов DICOM не найдено. Проверено: ${rawFiles.length}. Ожидается папка с файлами .dcm из томографа или ZIP-архив с ними.`
+        );
+        setIsLoading(false);
+        return;
+      }
 
-      setLoadingStatus('Регистрация DICOM в движке Cornerstone3D...');
-      const imageIds: string[] = [];
-      for (let i = 0; i < metaList.length; i++) {
-        const imageId = cornerstoneDICOMImageLoader.wadouri.fileManager.add(metaList[i].file);
-        imageIds.push(imageId);
-        if (i % 20 === 0 || i === metaList.length - 1) {
-          setProgress(60 + Math.round(((i + 1) / metaList.length) * 40));
+      setStatus(`Чтение заголовков — ${candidates.length} файлов…`);
+
+      const slices: SliceInfo[] = [];
+      for (let i = 0; i < candidates.length; i++) {
+        if (cancelRef.current) return stopped();
+        try {
+          // One file can hold a whole volume: multi-frame exports come back as
+          // many slices from a single read.
+          const parsed = await parseFile(candidates[i], i);
+          for (const slice of parsed) {
+            slices.push(slice);
+            addCustomMetadata(slice.imageId, slice.metadata);
+          }
+        } catch (err) {
+          if (err instanceof NotDicomError) rejected.push(err.message);
+          else rejected.push(`${candidates[i].name}: ${String((err as any)?.message || err)}`);
+        }
+
+        if (i % 10 === 0 || i === candidates.length - 1) {
+          setProgress(15 + Math.round((i / candidates.length) * 75));
+          // Without this the tab is frozen for the whole parse on a large study.
+          await yieldToUi();
         }
       }
 
-      setLoadingStatus('Готово! Запуск реконструкции...');
-      setTimeout(() => {
-        onImagesLoaded(imageIds);
-      }, 200);
+      if (slices.length === 0) {
+        setError('Ни один файл не удалось прочитать как срез изображения.');
+        setSkipped(rejected.slice(0, 8));
+        setIsLoading(false);
+        return;
+      }
 
+      if (cancelRef.current) return stopped();
+
+      setStatus('Группировка по сериям…');
+      setProgress(95);
+      await yieldToUi();
+
+      const series = buildSeries(slices);
+      setSkipped(rejected.slice(0, 8));
+      setProgress(100);
+      onSeriesReady(series);
     } catch (err: any) {
-      console.error('Error processing DICOM files:', err);
-      setError(err?.message || 'Ошибка при обработке файлов DICOM');
+      console.error('Ошибка обработки DICOM:', err);
+      setError(err?.message || 'Не удалось обработать выбранные файлы.');
       setIsLoading(false);
     }
+  };
+
+  /** Leaves the panel as it was before the user picked anything. */
+  const stopped = () => {
+    setIsLoading(false);
+    setProgress(0);
+    setStatus('');
+    clearCustomMetadata();
   };
 
   const handleZipFile = async (zipFile: File) => {
     setError(null);
     setIsLoading(true);
-    setProgress(10);
-    setLoadingStatus('Распаковка ZIP-архива в памяти...');
+    setProgress(0);
+    setStatus('Распаковка архива…');
+    cancelRef.current = false;
 
     try {
-      const zip = new JSZip();
-      const unzipped = await zip.loadAsync(zipFile);
-      const extractedFiles: File[] = [];
+      const zip = await new JSZip().loadAsync(zipFile);
+      const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+      const extracted: File[] = [];
 
-      const entries = Object.keys(unzipped.files);
-      let count = 0;
-
-      for (const filename of entries) {
-        const fileEntry = unzipped.files[filename];
-        if (!fileEntry.dir) {
-          const blob = await fileEntry.async('blob');
-          const file = new File([blob], filename.split('/').pop() || filename);
-          extractedFiles.push(file);
-        }
-        count++;
-        if (count % 20 === 0) {
-          setProgress(10 + Math.round((count / entries.length) * 30));
+      for (let i = 0; i < entries.length; i++) {
+        if (cancelRef.current) return stopped();
+        const entry = entries[i];
+        const blob = await entry.async('blob');
+        extracted.push(new File([blob], entry.name.split('/').pop() || entry.name));
+        if (i % 20 === 0) {
+          setProgress(Math.round((i / entries.length) * 20));
+          await yieldToUi();
         }
       }
 
-      await processFiles(extractedFiles);
+      await processFiles(extracted);
     } catch (err: any) {
-      console.error('Failed to unpack zip:', err);
-      setError('Не удалось распаковать ZIP-архив. Убедитесь, что архив корректен.');
+      console.error('Не удалось распаковать архив:', err);
+      setError('Архив не читается. Убедитесь, что это корректный ZIP с файлами DICOM.');
       setIsLoading(false);
     }
   };
 
-  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      processFiles(Array.from(files));
-    }
+  const handleSelection = (event: React.ChangeEvent<HTMLInputElement>, asZip = false) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    if (asZip) handleZipFile(files[0]);
+    else processFiles(Array.from(files));
+    // Allow picking the same folder twice in a row.
+    event.target.value = '';
   };
 
-  const handleFilesSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      processFiles(Array.from(files));
-    }
-  };
-
-  const handleZipSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files[0]) {
-      handleZipFile(files[0]);
-    }
-  };
-
-  // Drag & Drop Handler supporting folders, files, and zip
-  const handleDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
+  const handleDrop = async (event: React.DragEvent) => {
+    event.preventDefault();
     setIsDragging(false);
 
-    const items = e.dataTransfer.items;
+    const items = event.dataTransfer.items;
     if (!items || items.length === 0) {
-      if (e.dataTransfer.files.length > 0) {
-        const files = Array.from(e.dataTransfer.files);
-        if (files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')) {
-          handleZipFile(files[0]);
-        } else {
-          processFiles(files);
-        }
-      }
+      const files = Array.from(event.dataTransfer.files);
+      if (files.length === 1 && files[0].name.toLowerCase().endsWith('.zip')) handleZipFile(files[0]);
+      else if (files.length) processFiles(files);
       return;
     }
 
-    // Traverse directory tree if dropped a folder
-    const collectedFiles: File[] = [];
     setIsLoading(true);
-    setLoadingStatus('Чтение перетащенных объектов...');
+    setStatus('Чтение перетащенных файлов…');
 
-    const readEntry = async (entry: any): Promise<void> => {
-      if (entry.isFile) {
-        return new Promise((resolve) => {
-          entry.file((file: File) => {
-            collectedFiles.push(file);
-            resolve();
-          }, () => resolve());
-        });
-      } else if (entry.isDirectory) {
-        const dirReader = entry.createReader();
-        const readEntries = async (): Promise<void> => {
-          return new Promise((resolve) => {
-            dirReader.readEntries(async (entries: any[]) => {
-              if (entries.length > 0) {
-                for (const subEntry of entries) {
-                  await readEntry(subEntry);
-                }
-                await readEntries(); // Continue reading until empty
-              }
-              resolve();
-            }, () => resolve());
-          });
-        };
-        await readEntries();
-      }
-    };
+    const collected: File[] = [];
+    const entries = Array.from(items)
+      .filter((item) => item.kind === 'file')
+      .map((item) => (item as any).webkitGetAsEntry?.())
+      .filter(Boolean);
 
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.kind === 'file') {
-        const entry = (item as any).webkitGetAsEntry ? (item as any).webkitGetAsEntry() : null;
-        if (entry) {
-          await readEntry(entry);
-        } else {
-          const file = item.getAsFile();
-          if (file) collectedFiles.push(file);
-        }
-      }
+    for (const entry of entries) {
+      await walkEntry(entry, collected);
     }
 
-    if (collectedFiles.length === 1 && collectedFiles[0].name.toLowerCase().endsWith('.zip')) {
-      handleZipFile(collectedFiles[0]);
+    if (collected.length === 0) {
+      const files = Array.from(event.dataTransfer.files);
+      if (files.length) collected.push(...files);
+    }
+
+    if (collected.length === 1 && collected[0].name.toLowerCase().endsWith('.zip')) {
+      await handleZipFile(collected[0]);
+    } else if (collected.length) {
+      await processFiles(collected);
     } else {
-      processFiles(collectedFiles);
+      setIsLoading(false);
+      setError('В перетащенном не оказалось файлов.');
     }
   };
 
-  // Demo Scan Generator (Generates synthetic dental CBCT slices with a jaw arc & teeth)
-  const generateDemoCBCT = async () => {
+  const loadDemo = async () => {
+    setError(null);
     setIsLoading(true);
     setProgress(0);
-    setLoadingStatus('Генерация тестового КЛКТ скана (челюсть и зубы)...');
-
-    const slicesCount = 120;
-    const dim = 128; // 128x128 resolution for fast client-side demo generation
-    const generatedFiles: File[] = [];
-
-    for (let s = 0; s < slicesCount; s++) {
-      const zNorm = (s - slicesCount / 2) / (slicesCount / 2); // -1 to 1
-      const pixelData = new Int16Array(dim * dim);
-      pixelData.fill(-1000); // Air (-1000 HU)
-
-      for (let y = 0; y < dim; y++) {
-        for (let x = 0; x < dim; x++) {
-          const nx = (x - dim / 2) / (dim / 2);
-          const ny = (y - dim / 2) / (dim / 2);
-          const idx = y * dim + x;
-
-          // Parabolic Mandible Bone Arc: y = a*x^2 + b
-          const jawY = 0.55 * (nx * nx) - 0.2;
-          const distToJaw = Math.abs(ny - jawY);
-
-          // Soft tissue neck/face profile
-          const headDist = Math.sqrt(nx * nx + (ny + 0.1) * (ny + 0.1));
-          if (headDist < 0.85) {
-            pixelData[idx] = 40; // Soft tissue (+40 HU)
-          }
-
-          // Jaw bone (Mandible / Maxilla)
-          if (distToJaw < 0.16 && ny < 0.6 && ny > -0.7) {
-            pixelData[idx] = 750; // Cortical/trabecular bone (+750 HU)
-
-            // Teeth crowns & roots in the center slices
-            if (Math.abs(zNorm) < 0.4) {
-              const toothAngle = Math.atan2(ny, nx);
-              if (Math.sin(toothAngle * 14) > 0.3) {
-                pixelData[idx] = 1800; // Enamel / High Density Teeth (+1800 HU)
-              }
-            }
-          }
-
-          // Nerve canal in mandible (lower slices)
-          if (zNorm < -0.1 && zNorm > -0.5 && distToJaw < 0.04) {
-            pixelData[idx] = -30; // Mandibular nerve canal
-          }
-        }
-      }
-
-      // Minimal DICOM Part 10 Header
-      const headerLength = 1024;
-      const buffer = new ArrayBuffer(headerLength + pixelData.byteLength);
-      const u8 = new Uint8Array(buffer);
-
-      // Preamble at 128: 'DICM'
-      u8[128] = 0x44; u8[129] = 0x49; u8[130] = 0x43; u8[131] = 0x4d;
-
-      // Copy pixel data
-      new Int16Array(buffer, headerLength).set(pixelData);
-
-      // Construct a simple virtual file
-      const fakeFile = new File([buffer], `demo_slice_${String(s).padStart(3, '0')}.dcm`, {
-        type: 'application/dicom',
-      });
-      generatedFiles.push(fakeFile);
-
-      if (s % 20 === 0) {
-        setProgress(Math.round((s / slicesCount) * 80));
-      }
-    }
-
-    setLoadingStatus('Инициализация тестовых проекций...');
-    await processFiles(generatedFiles);
+    setStatus('Генерация тестовой модели челюсти…');
+    const files = await generateDemoStudy((pct) => setProgress(Math.round(pct * 0.3)));
+    await processFiles(files);
   };
 
   return (
-    <div 
-      onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        setIsDragging(true);
+      }}
       onDragLeave={() => setIsDragging(false)}
       onDrop={handleDrop}
       className={`max-w-2xl w-full mx-auto bg-gray-900 border-2 ${
-        isDragging ? 'border-blue-500 bg-gray-800 scale-[1.01]' : 'border-gray-700'
-      } border-dashed rounded-2xl p-8 transition-all duration-200 shadow-2xl flex flex-col items-center text-center`}
+        isDragging ? 'border-blue-500 bg-gray-800' : 'border-gray-700'
+      } border-dashed rounded-2xl p-8 transition-colors shadow-2xl flex flex-col items-center text-center`}
     >
-      {/* Hidden file inputs */}
-      <input
-        type="file"
-        ref={folderInputRef}
-        onChange={handleFolderSelect}
-        // @ts-ignore
-        webkitdirectory=""
-        // @ts-ignore
-        directory=""
-        multiple
-        className="hidden"
-      />
-      <input
-        type="file"
-        ref={filesInputRef}
-        onChange={handleFilesSelect}
-        multiple
-        accept=".dcm,application/dicom"
-        className="hidden"
-      />
-      <input
-        type="file"
-        ref={zipInputRef}
-        onChange={handleZipSelect}
-        accept=".zip,application/zip"
-        className="hidden"
-      />
+      <input type="file" ref={folderInputRef} onChange={(e) => handleSelection(e)} multiple className="hidden"
+        // @ts-expect-error non-standard attributes for folder selection
+        webkitdirectory="" directory="" />
+      <input type="file" ref={filesInputRef} onChange={(e) => handleSelection(e)} multiple className="hidden" />
+      <input type="file" ref={zipInputRef} onChange={(e) => handleSelection(e, true)} accept=".zip,application/zip" className="hidden" />
 
-      {/* Main Upload Content */}
       <div className="w-16 h-16 bg-blue-600/20 text-blue-400 rounded-full flex items-center justify-center mb-4 ring-8 ring-blue-500/10">
         <Upload className="w-8 h-8" />
       </div>
 
-      <h2 className="text-2xl font-bold text-white mb-2">
-        Загрузка КЛКТ (DICOM) исследования
-      </h2>
+      <h2 className="text-2xl font-bold text-white mb-2">Загрузка КЛКТ-исследования</h2>
       <p className="text-gray-400 text-sm max-w-md mb-6">
-        Перетащите сюда папку, файлы <code>.dcm</code> или <code>.zip</code> архив. Все данные обрабатываются на 100% локально в браузере.
+        Перетащите папку с файлами <code>.dcm</code> или ZIP-архив. Снимок никуда не отправляется — всё
+        обрабатывается в браузере на этом компьютере.
       </p>
 
-      {/* Action Buttons */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full mb-6">
         <button
           disabled={isLoading}
-          onClick={() => folderInputRef.current?.click()}
-          className="flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium rounded-xl transition-all shadow-lg hover:shadow-blue-500/25"
+          onClick={() =>
+            canReopenFolders() ? openFolderWithHandle() : folderInputRef.current?.click()
+          }
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-sm font-medium rounded-xl transition-colors"
         >
           <FolderOpen className="w-4 h-4" />
           Выбрать папку
         </button>
-
         <button
           disabled={isLoading}
           onClick={() => filesInputRef.current?.click()}
-          className="flex items-center justify-center gap-2 px-4 py-3 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 text-sm font-medium rounded-xl border border-gray-700 transition-all"
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 text-sm font-medium rounded-xl border border-gray-700 transition-colors"
         >
           <FileText className="w-4 h-4" />
           Выбрать файлы
         </button>
-
         <button
           disabled={isLoading}
           onClick={() => zipInputRef.current?.click()}
-          className="flex items-center justify-center gap-2 px-4 py-3 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 text-sm font-medium rounded-xl border border-gray-700 transition-all"
+          className="flex items-center justify-center gap-2 px-4 py-3 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 text-sm font-medium rounded-xl border border-gray-700 transition-colors"
         >
           <Archive className="w-4 h-4" />
           ZIP-архив
         </button>
       </div>
 
-      {/* Demo Button */}
-      <div className="w-full pt-4 border-t border-gray-800 flex flex-col items-center">
+      <div className="w-full pt-4 border-t border-gray-800 flex justify-center">
         <button
           disabled={isLoading}
-          onClick={generateDemoCBCT}
-          className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded-lg transition-all"
+          onClick={loadDemo}
+          className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 disabled:opacity-50 border border-emerald-500/30 rounded-lg transition-colors"
         >
           <Sparkles className="w-4 h-4" />
-          Нет файла? Загрузить тестовую КЛКТ модель челюсти
+          Нет снимка под рукой? Открыть тестовую модель челюсти
         </button>
       </div>
 
-      {/* Loading Progress State */}
+      {recent.length > 0 && !isLoading && (
+        <div className="w-full mt-6 pt-4 border-t border-gray-800 text-left">
+          <h3 className="flex items-center gap-1.5 text-xs font-semibold text-gray-400 mb-2">
+            <Clock className="w-3.5 h-3.5" />
+            Недавние исследования
+          </h3>
+          <ul className="flex flex-col gap-1">
+            {recent.map((entry) => (
+              <li
+                key={entry.id}
+                className="flex items-center gap-2 bg-gray-800/60 border border-gray-700 rounded-lg px-3 py-2"
+              >
+                <button
+                  onClick={() => openRecent(entry)}
+                  disabled={!entry.handle}
+                  className="flex-grow min-w-0 text-left disabled:opacity-50"
+                  title={entry.handle ? 'Открыть заново' : 'Браузер не сохранил доступ к этой папке'}
+                >
+                  <div className="text-sm text-gray-100 truncate">
+                    {entry.patientName || entry.folderName}
+                  </div>
+                  <div className="text-[11px] text-gray-500 truncate">
+                    {entry.description} · {slices(entry.sliceCount)} · {whenOpened(entry.openedAt)}
+                  </div>
+                </button>
+                <button
+                  onClick={async () => {
+                    await forgetStudy(entry.id);
+                    setRecent(await listRecent());
+                  }}
+                  title="Убрать из списка"
+                  className="p-1 rounded text-gray-600 hover:text-red-400"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+          <p className="text-[10px] text-gray-600 mt-2">
+            Запоминается только путь к папке — снимки остаются на диске и никуда не копируются.
+          </p>
+        </div>
+      )}
+
       {isLoading && (
-        <div className="mt-6 w-full bg-gray-800/80 rounded-xl p-4 border border-blue-500/30 animate-pulse">
-          <div className="flex items-center justify-between text-xs text-blue-400 mb-2 font-medium">
-            <span className="flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              {loadingStatus}
+        <div className="mt-6 w-full bg-gray-800/80 rounded-xl p-4 border border-blue-500/30">
+          <div className="flex items-center justify-between text-xs text-blue-300 mb-2 font-medium gap-3">
+            <span className="flex items-center gap-2 min-w-0">
+              <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />
+              <span className="truncate">{status}</span>
             </span>
-            <span>{progress}%</span>
+            <span className="flex items-center gap-2 flex-shrink-0">
+              <span className="font-mono tabular-nums">{progress}%</span>
+              <button
+                onClick={() => {
+                  cancelRef.current = true;
+                }}
+                title="Прекратить чтение файлов"
+                className="flex items-center gap-1 px-2 py-0.5 rounded border border-gray-600 text-gray-300 hover:text-white hover:bg-gray-700"
+              >
+                <X className="w-3 h-3" />
+                Отменить
+              </button>
+            </span>
           </div>
-          <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
-            <div 
-              className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 transition-all duration-200 rounded-full"
+          <div className="w-full h-1.5 bg-gray-700 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 transition-[width] duration-200 rounded-full"
               style={{ width: `${progress}%` }}
             />
           </div>
         </div>
       )}
 
-      {/* Error Message */}
       {error && (
-        <div className="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs flex items-center gap-2 text-left">
-          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+        <div className="mt-4 w-full p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-300 text-xs flex items-start gap-2 text-left">
+          <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
           <span>{error}</span>
         </div>
+      )}
+
+      {skipped.length > 0 && (
+        <details className="mt-3 w-full text-left">
+          <summary className="text-[11px] text-gray-500 cursor-pointer hover:text-gray-300">
+            Пропущено файлов: {skipped.length}
+          </summary>
+          <ul className="mt-2 text-[11px] text-gray-500 font-mono space-y-0.5">
+            {skipped.map((name) => (
+              <li key={name} className="truncate">
+                {name}
+              </li>
+            ))}
+          </ul>
+        </details>
       )}
     </div>
   );
 };
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function walkEntry(entry: any, collected: File[]): Promise<void> {
+  if (!entry) return;
+
+  if (entry.isFile) {
+    await new Promise<void>((resolve) => {
+      entry.file((file: File) => {
+        collected.push(file);
+        resolve();
+      }, () => resolve());
+    });
+    return;
+  }
+
+  if (entry.isDirectory) {
+    const reader = entry.createReader();
+    // readEntries returns at most 100 items per call and must be drained.
+    for (;;) {
+      const batch: any[] = await new Promise((resolve) => {
+        reader.readEntries((items: any[]) => resolve(items || []), () => resolve([]));
+      });
+      if (batch.length === 0) break;
+      for (const child of batch) {
+        await walkEntry(child, collected);
+      }
+    }
+  }
+}
